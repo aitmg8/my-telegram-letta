@@ -5,6 +5,7 @@ import httpx
 app = FastAPI()
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]                      # <- keep this
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]                      # <- keep this
 LETTA_BASE_URL = os.environ["LETTA_BASE_URL"].rstrip("/")
 LETTA_AGENT_ID = os.environ["LETTA_AGENT_ID"]
 LETTA_TOKEN = os.environ.get("LETTA_TOKEN")              # optional
