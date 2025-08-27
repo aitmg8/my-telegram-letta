@@ -4,12 +4,11 @@ import httpx
 
 app = FastAPI()
 
-BOT_TOKEN = os.environ["8380690989:AAE0AZEbZdjQZVX901DzKKkQPoymXvENrYk"]
-LETTA_BASE_URL = os.environ["https://lettalettalatest-production-e0a4.up.railway.app"].rstrip("/")
-LETTA_AGENT_ID = os.environ["agent-63b9ba8e-7d6a-420d-a63b-aa3f5497c54a"]
-LETTA_TOKEN = os.environ.get("5793")
-
-TELEGRAM_API = f"https://api.telegram.org/bot8380690989:AAE0AZEbZdjQZVX901DzKKkQPoymXvENrYk"
+BOT_TOKEN = os.environ["BOT_TOKEN"]                      # <- keep this
+LETTA_BASE_URL = os.environ["LETTA_BASE_URL"].rstrip("/")
+LETTA_AGENT_ID = os.environ["LETTA_AGENT_ID"]
+LETTA_TOKEN = os.environ.get("LETTA_TOKEN")              # optional
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 def auth_headers():
     h = {"Content-Type": "application/json"}
