@@ -16,7 +16,7 @@ LETTA_TOKEN     = os.getenv("LETTA_TOKEN")  # optional
 POLL_INTERVAL   = float(os.getenv("LETTA_POLL_INTERVAL", "2.5"))
 POLL_TIMEOUT    = float(os.getenv("LETTA_POLL_TIMEOUT",  "600"))  # 10 minutes cap
 
-# Network knobs (for each short call: create + poll)
+# Network knobs (per request)
 CONNECT_TIMEOUT = float(os.getenv("CONNECT_TIMEOUT", "20"))
 READ_TIMEOUT    = float(os.getenv("READ_TIMEOUT",   "30"))
 
@@ -76,7 +76,12 @@ async def letta_create_task(user_text: str) -> str:
         "async": True  # Letta should queue work and return a task id
     }
 
-    timeout = httpx.Timeout(CONNECT_TIMEOUT, READ_TIMEOUT, 15, READ_TIMEOUT)
+    timeout = httpx.Timeout(
+        connect=CONNECT_TIMEOUT,
+        read=READ_TIMEOUT,
+        write=15.0,
+        pool=READ_TIMEOUT,
+    )
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as c:
         r = await c.post(url, headers=auth_headers(), json=payload)
         try:
@@ -97,7 +102,12 @@ async def letta_poll_task(task_id: str) -> dict:
     """Poll /v1/tasks/{task_id} until completion or timeout; return final payload."""
     url = f"{LETTA_BASE_URL}/v1/tasks/{task_id}"
     deadline = asyncio.get_event_loop().time() + POLL_TIMEOUT
-    timeout = httpx.Timeout(CONNECT_TIMEOUT, READ_TIMEOUT, 15, READ_TIMEOUT)
+    timeout = httpx.Timeout(
+        connect=CONNECT_TIMEOUT,
+        read=READ_TIMEOUT,
+        write=15.0,
+        pool=READ_TIMEOUT,
+    )
 
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as c:
         while True:
@@ -148,7 +158,6 @@ async def query_letta_via_task(chat_id: int, user_text: str):
         log.info("Task %s succeeded; sending reply", task_id)
     except TimeoutError:
         reply = "(Still working—I’ll keep checking and reply when ready.)"
-        # Optional late-finish delivery:
         asyncio.create_task(_finish_and_send_when_ready(chat_id, task_id))
     except Exception as e:
         log.exception("Polling failed: %s", e)
