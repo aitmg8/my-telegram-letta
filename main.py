@@ -16,14 +16,15 @@ LETTA_TOKEN     = os.getenv("LETTA_TOKEN")  # optional
 POLL_INTERVAL   = float(os.getenv("LETTA_POLL_INTERVAL", "2.5"))
 POLL_TIMEOUT    = float(os.getenv("LETTA_POLL_TIMEOUT",  "600"))  # 10 minutes cap
 
-# Network knobs
+# Network knobs (for each short call: create + poll)
 CONNECT_TIMEOUT = float(os.getenv("CONNECT_TIMEOUT", "20"))
-READ_TIMEOUT    = float(os.getenv("READ_TIMEOUT",   "30"))        # for each poll call
+READ_TIMEOUT    = float(os.getenv("READ_TIMEOUT",   "30"))
 
 TELEGRAM_API    = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else None
 
 
 def auth_headers():
+    """Build headers for Letta (properly uses LETTA_TOKEN)."""
     h = {"Content-Type": "application/json"}
     if LETTA_TOKEN:
         h["Authorization"] = f"Bearer {LETTA_TOKEN}"
@@ -45,9 +46,12 @@ async def send_typing(chat_id: int):
 
 
 async def telegram_send(chat_id: int, text: str):
-    async with httpx.AsyncClient(timeout=15) as c:
-        await c.post(f"{TELEGRAM_API}/sendMessage",
-                     json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True})
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            await c.post(f"{TELEGRAM_API}/sendMessage",
+                         json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True})
+    except Exception as e:
+        log.exception("Telegram sendMessage failed: %s", e)
 
 
 def extract_reply_from_messages(payload: dict) -> str:
@@ -63,26 +67,34 @@ def extract_reply_from_messages(payload: dict) -> str:
 
 
 # ====== LETTA CLIENT (task-id model) ======
-async def letta_create_task(user_text: str) -> Optional[str]:
+async def letta_create_task(user_text: str) -> str:
+    """Ask Letta to start work and return a task_id quickly."""
     url = f"{LETTA_BASE_URL}/v1/agents/{LETTA_AGENT_ID}/messages"
     payload = {
         "messages": [{"role": "user", "content": [{"type": "text", "text": user_text}]}],
         "use_assistant_message": True,
-        "async": True
+        "async": True  # Letta should queue work and return a task id
     }
 
     timeout = httpx.Timeout(CONNECT_TIMEOUT, READ_TIMEOUT, 15, READ_TIMEOUT)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as c:
         r = await c.post(url, headers=auth_headers(), json=payload)
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            log.error("Create task HTTP %s: %s", e.response.status_code, e.response.text[:400])
+            raise
         data = r.json()
         task_id = data.get("task_id") or data.get("id") or (data.get("task") or {}).get("id")
         if not task_id:
+            log.error("Letta create response missing task_id: %s", json.dumps(data)[:400])
             raise RuntimeError("No task_id in Letta response; server may not support async.")
+        log.info("Created Letta task_id=%s", task_id)
         return task_id
 
 
 async def letta_poll_task(task_id: str) -> dict:
+    """Poll /v1/tasks/{task_id} until completion or timeout; return final payload."""
     url = f"{LETTA_BASE_URL}/v1/tasks/{task_id}"
     deadline = asyncio.get_event_loop().time() + POLL_TIMEOUT
     timeout = httpx.Timeout(CONNECT_TIMEOUT, READ_TIMEOUT, 15, READ_TIMEOUT)
@@ -90,10 +102,17 @@ async def letta_poll_task(task_id: str) -> dict:
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as c:
         while True:
             r = await c.get(url, headers=auth_headers())
-            r.raise_for_status()
-            data = r.json()
+            try:
+                r.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                log.error("Poll task %s HTTP %s: %s",
+                          task_id, e.response.status_code, e.response.text[:400])
+                raise
 
+            data = r.json()
             status = (data.get("status") or "").lower()
+            log.debug("Task %s status=%s", task_id, status)
+
             if status in {"succeeded", "completed", "done"}:
                 return data
             if status in {"failed", "error", "canceled", "cancelled"}:
@@ -106,19 +125,12 @@ async def letta_poll_task(task_id: str) -> dict:
 
 
 async def query_letta_via_task(chat_id: int, user_text: str):
+    """Background job: create task, poll until done, send Telegram reply."""
     typing_task = asyncio.create_task(_typing_loop(chat_id))
+    log.info("Telegram update: chat_id=%s text=%r", chat_id, user_text)
 
     try:
         task_id = await letta_create_task(user_text)
-    except httpx.HTTPStatusError as e:
-        body = e.response.text[:400]
-        reply = f"(Letta error {e.response.status_code})"
-        log.error("Create task error %s: %s", e.response.status_code, body)
-        await telegram_send(chat_id, reply)
-        typing_task.cancel()
-        with contextlib.suppress(Exception):
-            await typing_task
-        return
     except Exception as e:
         log.exception("Create task failed: %s", e)
         await telegram_send(chat_id, "(Letta request failed)")
@@ -129,12 +141,14 @@ async def query_letta_via_task(chat_id: int, user_text: str):
 
     try:
         final = await letta_poll_task(task_id)
-        reply = extract_reply_from_messages(final) \
-                or extract_reply_from_messages(final.get("result", {})) \
-                or final.get("result_text") \
-                or "(no reply)"
+        reply = (extract_reply_from_messages(final)
+                 or extract_reply_from_messages(final.get("result", {}))
+                 or final.get("result_text")
+                 or "(no reply)")
+        log.info("Task %s succeeded; sending reply", task_id)
     except TimeoutError:
         reply = "(Still working—I’ll keep checking and reply when ready.)"
+        # Optional late-finish delivery:
         asyncio.create_task(_finish_and_send_when_ready(chat_id, task_id))
     except Exception as e:
         log.exception("Polling failed: %s", e)
@@ -148,15 +162,16 @@ async def query_letta_via_task(chat_id: int, user_text: str):
 
 
 async def _finish_and_send_when_ready(chat_id: int, task_id: str):
+    """Continue polling after timeout and send final result when ready."""
     try:
         final = await letta_poll_task(task_id)
-        reply = extract_reply_from_messages(final) \
-                or extract_reply_from_messages(final.get("result", {})) \
-                or final.get("result_text") \
-                or "(no reply)"
+        reply = (extract_reply_from_messages(final)
+                 or extract_reply_from_messages(final.get("result", {}))
+                 or final.get("result_text")
+                 or "(no reply)")
         await telegram_send(chat_id, reply)
     except Exception as e:
-        log.debug("Late-finish polling aborted: %s", e)
+        log.debug("Late-finish polling aborted for %s: %s", task_id, e)
 
 
 async def _typing_loop(chat_id: int):
@@ -185,9 +200,7 @@ async def healthz():
 @app.get("/debug/letta")
 async def debug_letta():
     try:
-        headers = {}
-        if LETTA_TOKEN:
-            headers["Authorization"] = f"Bearer {LETTA_TOKEN}"
+        headers = auth_headers()
         async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
             r = await c.get(f"{LETTA_BASE_URL}/v1/health/", headers=headers)
         return {"ok": r.is_success, "status": r.status_code, "text": r.text[:200]}
@@ -216,4 +229,3 @@ async def telegram_webhook(token: str, request: Request):
 
     asyncio.create_task(query_letta_via_task(chat_id, text))
     return {"ok": True}
-
