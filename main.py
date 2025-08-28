@@ -1,21 +1,18 @@
-# main.py
-import os
-import json
-import logging
+import os, json, asyncio, logging
 from fastapi import FastAPI, Request, HTTPException
 import httpx
 
 log = logging.getLogger("uvicorn.error")
 app = FastAPI()
 
-# ---- Required envs (use only BOT_TOKEN) ----
-BOT_TOKEN = os.getenv("BOT_TOKEN")                    # Telegram BotFather token
-LETTA_BASE_URL = (os.getenv("LETTA_BASE_URL") or "").rstrip("/")
-LETTA_AGENT_ID = os.getenv("LETTA_AGENT_ID")
-LETTA_TOKEN = os.getenv("LETTA_TOKEN")                # optional if Letta is unsecured
+# --- env vars ---
+BOT_TOKEN       = os.getenv("BOT_TOKEN")
+LETTA_BASE_URL  = (os.getenv("LETTA_BASE_URL") or "").rstrip("/")
+LETTA_AGENT_ID  = os.getenv("LETTA_AGENT_ID")
+LETTA_TOKEN     = os.getenv("LETTA_TOKEN")  # optional
 
 if not all([BOT_TOKEN, LETTA_BASE_URL, LETTA_AGENT_ID]):
-    missing = [k for k, v in {
+    missing = [k for k,v in {
         "BOT_TOKEN": BOT_TOKEN,
         "LETTA_BASE_URL": LETTA_BASE_URL,
         "LETTA_AGENT_ID": LETTA_AGENT_ID,
@@ -30,6 +27,78 @@ def auth_headers():
         h["Authorization"] = f"Bearer {LETTA_TOKEN}"
     return h
 
+# ---------- utilities ----------
+async def send_typing(chat_id: int):
+    try:
+        async with httpx.AsyncClient(timeout=5) as c:
+            await c.post(f"{TELEGRAM_API}/sendChatAction",
+                         json={"chat_id": chat_id, "action": "typing"})
+    except Exception as e:
+        log.debug("send_typing failed: %s", e)
+
+def extract_reply(data: dict) -> str:
+    # pull first textual assistant content we can find
+    for m in data.get("messages", []):
+        c = m.get("content")
+        if isinstance(c, list):
+            for p in c:
+                if isinstance(p, dict):
+                    if p.get("type") == "text" and p.get("text"):
+                        return p["text"]
+                    if p.get("type") == "assistant_message" and p.get("message"):
+                        return p["message"]
+        elif isinstance(c, str) and c.strip():
+            return c.strip()
+    return "(no reply)"
+
+async def query_letta_and_reply(chat_id: int, user_text: str):
+    # periodic "typing…" while we work
+    typing_task = asyncio.create_task(_typing_loop(chat_id))
+
+    reply = "(Letta request failed)"
+    try:
+        payload = {
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": user_text}]}
+            ],
+            "use_assistant_message": True
+        }
+        timeout = httpx.Timeout(connect=20.0, read=120.0, write=30.0, pool=120.0)
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            r = await c.post(f"{LETTA_BASE_URL}/v1/agents/{LETTA_AGENT_ID}/messages",
+                             headers=auth_headers(), json=payload)
+            r.raise_for_status()
+            reply = extract_reply(r.json())
+    except httpx.HTTPStatusError as e:
+        log.error("Letta %s: %s", e.response.status_code, e.response.text[:400])
+        reply = f"(Letta error {e.response.status_code})"
+    except Exception as e:
+        log.exception("Letta request failed: %s", e)
+        reply = "(Letta request failed)"
+    finally:
+        typing_task.cancel()
+        with contextlib.suppress(Exception):
+            await typing_task
+
+    # send answer back to user
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            await c.post(f"{TELEGRAM_API}/sendMessage",
+                         json={"chat_id": chat_id, "text": reply,
+                               "disable_web_page_preview": True})
+    except Exception as e:
+        log.exception("Telegram sendMessage failed: %s", e)
+
+async def _typing_loop(chat_id: int):
+    # send typing every ~4s until cancelled
+    try:
+        while True:
+            await send_typing(chat_id)
+            await asyncio.sleep(4)
+    except asyncio.CancelledError:
+        pass
+
+# ---------- endpoints ----------
 @app.get("/healthz")
 async def healthz():
     return {
@@ -40,13 +109,23 @@ async def healthz():
         "uses_auth": bool(LETTA_TOKEN),
     }
 
+@app.get("/debug/letta")
+async def debug_letta():
+    # quick reachability test to Letta
+    try:
+        headers = {}
+        if LETTA_TOKEN:
+            headers["Authorization"] = f"Bearer {LETTA_TOKEN}"
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(f"{LETTA_BASE_URL}/v1/health", headers=headers)
+        return {"ok": r.is_success, "status": r.status_code, "text": r.text[:200]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 @app.post("/telegram/{token}")
 async def telegram_webhook(token: str, request: Request):
-    # Basic sanity checks
     if not (BOT_TOKEN and LETTA_BASE_URL and LETTA_AGENT_ID):
         raise HTTPException(status_code=500, detail="Missing required environment variables")
-
-    # Shared-secret path check
     if token != BOT_TOKEN:
         raise HTTPException(status_code=403, detail="forbidden")
 
@@ -59,53 +138,13 @@ async def telegram_webhook(token: str, request: Request):
     text = (message.get("text") or "").strip()
     chat_id = (message.get("chat") or {}).get("id")
     if not (text and chat_id):
-        # Ignore non-text updates
+        # ignore non-text updates
         log.info("Ignoring update: %s", json.dumps(update)[:500])
         return {"ok": True}
 
-    # ---- 1) Forward to Letta ----
-    payload = {
-        "messages": [
-            {"role": "user", "content": [{"type": "text", "text": text}]}
-        ],
-        "use_assistant_message": True
-    }
-    letta_url = f"{LETTA_BASE_URL}/v1/agents/{LETTA_AGENT_ID}/messages"
-
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(letta_url, headers=auth_headers(), json=payload)
-            r.raise_for_status()
-            data = r.json()
-            # Try common shapes for reply text
-            reply = "(no reply)"
-            for m in data.get("messages", []):
-                c = m.get("content")
-                if isinstance(c, list):
-                    for p in c:
-                        if isinstance(p, dict) and p.get("type") == "text" and p.get("text"):
-                            reply = p["text"]
-                            break
-                elif isinstance(c, str) and c.strip():
-                    reply = c.strip()
-                if reply != "(no reply)":
-                    break
-    except httpx.HTTPStatusError as e:
-        log.error("Letta %s: %s", e.response.status_code, e.response.text[:500])
-        reply = f"(Letta error {e.response.status_code})"
-    except Exception as e:
-        log.exception("Letta request failed: %s", e)
-        reply = "(Letta request failed)"
-
-    # ---- 2) Send back to Telegram ----
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            await client.post(
-                f"{TELEGRAM_API}/sendMessage",
-                json={"chat_id": chat_id, "text": reply, "disable_web_page_preview": True}
-            )
-    except Exception as e:
-        log.exception("Telegram sendMessage failed: %s", e)
-        raise HTTPException(status_code=502, detail="telegram send failed")
-
+    # fire-and-forget; immediately ACK Telegram
+    asyncio.create_task(query_letta_and_reply(chat_id, text))
     return {"ok": True}
+
+# needed for contextlib in finally
+import contextlib
